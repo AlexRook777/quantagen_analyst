@@ -10,5 +10,14 @@ python-multipart
 requests
 yfinance
 langchain
+langchain-community
 openai
+#langchain-openai
+langchain-huggingface
+sentence-transformers
+langchain-text-splitters
+sentence-transformers
 chromadb
+sec-edgar-downloader
+glob2
+unstructured
