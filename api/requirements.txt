@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+pydantic
+pandas
+scikit-learn
+torch
+joblib
+python-multipart
+requests
+yfinance
+langchain
+openai
+chromadb

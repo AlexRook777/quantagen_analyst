@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+*.pth
+*.joblib
+data/
+api/saved_models/
+.vscode/
+.DS_Store
+.env.local

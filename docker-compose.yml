@@ -1,0 +1,33 @@
+version: "3.8"
+
+services:
+  api:
+    build: ./api
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    depends_on:
+      - db
+      - vector_db
+    volumes:
+      - ./api:/app
+      - ./data:/data
+
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: quantagen
+    volumes:
+      - ./data/postgres_data:/var/lib/postgresql/data
+
+  vector_db:
+    image: ghcr.io/chroma-core/chroma:latest
+    environment:
+      CHROMA_DB_IMPL: duckdb+parquet
+    volumes:
+      - ./data/chroma_data:/chroma
+    ports:
+      - "8001:8001"
