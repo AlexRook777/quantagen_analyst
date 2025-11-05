@@ -3,6 +3,7 @@ uvicorn[standard]
 sqlalchemy
 pydantic
 pandas
+pandas_ta
 scikit-learn
 torch
 joblib
@@ -22,5 +23,8 @@ sec-edgar-downloader
 sec_api
 glob2
 unstructured
-
+psycopg2-binary
+asyncio
+joblib
+matplotlib
 

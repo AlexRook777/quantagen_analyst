@@ -1,5 +1,0 @@
-pytest
-httpx
-pytest-asyncio
-pytest-mock
-black
