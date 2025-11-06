@@ -8,8 +8,8 @@ and generate forecasts using a pre-trained model.
 import logging
 import os
 from typing import List, Optional
-import asyncio  # <-- 1. ДОБАВЛЕНО
-import cachetools.func  # <-- 2. ДОБАВЛЕНО
+import asyncio  # <-- 1. ADDED
+import cachetools.func  # <-- 2. ADDED
 
 import joblib
 import numpy as np
@@ -97,7 +97,7 @@ class ForecastService:
                 num_layers=self.config.num_layers,
                 output_size=self.config.forecast_horizon
             )
-            # Загружаем модель на CPU, что безопасно для инференса в FastAPI
+            # Load model on CPU, which is safe for inference in FastAPI
             self.model.load_state_dict(torch.load(self.config.model_path, map_location=torch.device('cpu')))
             self.model.eval()
             
@@ -331,22 +331,22 @@ class ForecastService:
             logger.error(f"Failed to generate forecast for {ticker}: {e}")
             raise
 
-# --- 3. СОЗДАЕМ "СИНГЛТОН" (ЕДИНЫЙ ЭКЗЕМПЛЯР) ---
-# Этот код выполнится один раз при импорте, загрузив модель и scaler в память.
+# --- 3. CREATE "SINGLETON" (SINGLE INSTANCE) ---
+# This code will run once on import, loading the model and scaler into memory.
 try:
     _forecast_service_singleton = ForecastService()
 except Exception as e:
     logger.critical(f"Failed to initialize global ForecastService singleton: {e}")
     _forecast_service_singleton = None
 
-# --- 4. ОПРЕДЕЛЯЕМ КЭШИРОВАННУЮ БЛОКИРУЮЩУЮ ФУНКЦИЮ ---
-# Эта функция будет "оберткой" для вызова нашего синглтона
-# Кэш на 100 тикеров, "время жизни" - 900 секунд (15 минут)
+# --- 4. DEFINE CACHED BLOCKING FUNCTION ---
+# This function will be a "wrapper" for calling our singleton
+# Cache for 100 tickers, "time to live" - 900 seconds (15 minutes)
 @cachetools.func.ttl_cache(maxsize=100, ttl=900)
 def _get_forecast_blocking_cached(ticker: str) -> List[float]:
     """
-    Внутренняя кэшируемая функция, которая выполняет тяжелую работу.
-    Вызывает метод get_forecast() нашего глобального синглтона.
+    Internal cacheable function that performs the heavy work.
+    Calls the get_forecast() method of our global singleton.
     """
     if _forecast_service_singleton is None:
         logger.error("ForecastService singleton is not initialized.")
@@ -355,7 +355,7 @@ def _get_forecast_blocking_cached(ticker: str) -> List[float]:
     logger.info(f"Cache miss. Generating new forecast for {ticker}")
     return _forecast_service_singleton.get_forecast(ticker)
 
-# --- 5. СОЗДАЕМ АСИНХРОННУЮ "ОБЕРТКУ", КОТОРУЮ ВЫЗЫВАЕТ FASTAPI ---
+# --- 5. CREATE ASYNC "WRAPPER" THAT FASTAPI CALLS ---
 async def get_forecast_async(ticker: str) -> List[float]:
     """
     Generate a stock price forecast using async execution and caching.
@@ -370,10 +370,9 @@ async def get_forecast_async(ticker: str) -> List[float]:
         List of predicted prices
     """
     try:
-        # Вызываем кэшированную функцию в отдельном потоке
+        # Call the cached function in a separate thread
         return await asyncio.to_thread(_get_forecast_blocking_cached, ticker)
     except Exception as e:
         logger.error(f"Error in async forecast for {ticker}: {e}")
-        # Передаем ошибку дальше, чтобы FastAPI мог ее поймать
+        # Pass error forward so FastAPI can catch it
         raise
-

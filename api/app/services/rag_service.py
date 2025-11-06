@@ -3,7 +3,8 @@ from dataclasses import dataclass
 import os
 import logging
 from dotenv import load_dotenv
-from cachetools import TTLCache
+import asyncio  
+import cachetools.func  
 
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
@@ -336,78 +337,66 @@ class RAGService:
             raise
 
 
-class AsyncRAGService:
+# Create global singleton instance 
+try:
+    _rag_service_singleton = RAGService()
+except Exception as e:
+    logger.critical(f"Failed to initialize global RAGService singleton: {e}")
+    _rag_service_singleton = None
+
+# Initialize the singleton service
+if _rag_service_singleton is not None:
+    asyncio.create_task(_rag_service_singleton.initialize())
+
+# Define cached blocking function with decorator
+@cachetools.func.ttl_cache(maxsize=256, ttl=3600)
+def _answer_question_blocking_cached(ticker: str, question: str) -> Dict[str, Any]:
     """
-    Singleton async wrapper for RAG service to avoid repeated initialization.
-    
-    This class manages a single RAG service instance that can be reused across
-    multiple requests, avoiding the overhead of initialization per request.
+    Internal cacheable function that performs the heavy work.
+    Calls the answer_question() method of our global singleton synchronously.
     """
+    if _rag_service_singleton is None:
+        logger.error("RAGService singleton is not initialized.")
+        raise RuntimeError("RAGService is not available due to initialization failure.")
     
-    _instance: Optional['AsyncRAGService'] = None
-    _initialized: bool = False
-    
-    def __new__(cls) -> 'AsyncRAGService':
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
-    
-    def __init__(self):
-        if not self._initialized:
-            self.service: Optional[RAGService] = None
-            self.cache: TTLCache = TTLCache(maxsize=256, ttl=3600) # Cache for responses
-            self._initialized = True
-    
-    async def initialize_once(self) -> None:
-        """Initialize the RAG service once across all instances."""
-        if self.service is None:
-            self.service = RAGService()
-            await self.service.initialize()
-    
-    async def answer_question(self, ticker: str, question: str) -> Dict[str, Any]:
-        """
-        Answer a question using the shared RAG service instance.
+    try:
+        # Create a new event loop if none exists
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        response_obj = loop.run_until_complete(_rag_service_singleton.answer_question(ticker, question))
+        loop.close()
         
-        Args:
-            ticker: Stock ticker symbol
-            question: Question to answer
-            
-        Returns:
-            Dictionary with answer and metadata
-        """
-        await self.initialize_once()
-        
-        if self.service is None:
-            raise RuntimeError("RAG service failed to initialize")
-        
-        # Cache key creation
-        cache_key = (ticker.upper(), question.lower().strip())
-        
-        # Check cache
-        cached_result = self.cache.get(cache_key)
-        if cached_result:
-            logger.info(f"Returning CACHED RAG response for {ticker}")
-            return cached_result
-            
-        # Cache miss - generate new response
-        logger.info(f"Cache miss. Generating new RAG response for {ticker}")
-        response_obj = await self.service.answer_question(ticker, question)
-        
-        # Convert RAGResponse to dictionary for caching
-        result_dict = {
+        # Convert RAGResponse to dictionary for consistency
+        return {
             "ticker": response_obj.ticker,
             "question": response_obj.question,
             "answer": response_obj.answer,
             "retrieval_count": response_obj.retrieval_count,
             "sources": response_obj.sources
         }
-        
-        # Cache the result
-        self.cache[cache_key] = result_dict
-        return result_dict
+    except Exception as e:
+        logger.error(f"Error in cached RAG operation for {ticker}: {e}")
+        raise
+
+# Create async wrapper function for FastAPI
+async def get_rag_response_async(ticker: str, question: str) -> Dict[str, Any]:
+    """
+    Generate RAG response using async execution and caching.
     
-    async def shutdown(self) -> None:
-        """Shutdown the shared RAG service instance."""
-        if self.service is not None:
-            await self.service.shutdown()
-            self.service = None
+    This function wraps the synchronous, cached RAG operation in an 
+    async context to prevent blocking the event loop.
+    
+    Args:
+        ticker: Stock ticker symbol
+        question: Question to answer
+        
+    Returns:
+        Dictionary with answer and metadata
+    """
+    try:
+        # Call the cached function in a separate thread
+        return await asyncio.to_thread(_answer_question_blocking_cached, ticker, question)
+    except Exception as e:
+        logger.error(f"Error in async RAG response for {ticker}: {e}")
+        # Pass error forward so FastAPI can catch it
+        raise

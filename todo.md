@@ -1,9 +1,0 @@
-- [x] Analyze current codebase to identify backward compatibility functions
-- [x] Examine forecast_service.py for backward compatibility functions
-- [x] Search entire codebase for backward compatibility markers
-- [ ] Fix imports in main.py
-- [ ] Remove backward compatibility functions from forecast_service.py
-- [ ] Remove backward compatibility functions from rag_service.py
-- [ ] Update main.py to use service classes directly
-- [ ] Remove backward compatibility functions from graph.py
-- [ ] Test the changes
