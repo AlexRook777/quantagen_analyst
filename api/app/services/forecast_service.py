@@ -5,10 +5,11 @@ This module provides functionality to load financial data, perform feature engin
 and generate forecasts using a pre-trained model.
 """
 
-import asyncio
 import logging
 import os
 from typing import List, Optional
+import asyncio  # <-- 1. ДОБАВЛЕНО
+import cachetools.func  # <-- 2. ДОБАВЛЕНО
 
 import joblib
 import numpy as np
@@ -96,7 +97,8 @@ class ForecastService:
                 num_layers=self.config.num_layers,
                 output_size=self.config.forecast_horizon
             )
-            self.model.load_state_dict(torch.load(self.config.model_path))
+            # Загружаем модель на CPU, что безопасно для инференса в FastAPI
+            self.model.load_state_dict(torch.load(self.config.model_path, map_location=torch.device('cpu')))
             self.model.eval()
             
             logger.info("Successfully initialized forecast service artifacts")
@@ -329,34 +331,37 @@ class ForecastService:
             logger.error(f"Failed to generate forecast for {ticker}: {e}")
             raise
 
+# --- 3. СОЗДАЕМ "СИНГЛТОН" (ЕДИНЫЙ ЭКЗЕМПЛЯР) ---
+# Этот код выполнится один раз при импорте, загрузив модель и scaler в память.
+try:
+    _forecast_service_singleton = ForecastService()
+except Exception as e:
+    logger.critical(f"Failed to initialize global ForecastService singleton: {e}")
+    _forecast_service_singleton = None
 
-# Global instance for backward compatibility
-_forecast_service = None
-
-def get_forecast(ticker: str) -> List[float]:
+# --- 4. ОПРЕДЕЛЯЕМ КЭШИРОВАННУЮ БЛОКИРУЮЩУЮ ФУНКЦИЮ ---
+# Эта функция будет "оберткой" для вызова нашего синглтона
+# Кэш на 100 тикеров, "время жизни" - 900 секунд (15 минут)
+@cachetools.func.ttl_cache(maxsize=100, ttl=900)
+def _get_forecast_blocking_cached(ticker: str) -> List[float]:
     """
-    Generate a stock price forecast (backward compatibility function).
-    
-    Args:
-        ticker: Stock ticker symbol
+    Внутренняя кэшируемая функция, которая выполняет тяжелую работу.
+    Вызывает метод get_forecast() нашего глобального синглтона.
+    """
+    if _forecast_service_singleton is None:
+        logger.error("ForecastService singleton is not initialized.")
+        raise RuntimeError("ForecastService is not available due to initialization failure.")
         
-    Returns:
-        List of predicted prices
-    """
-    global _forecast_service
-    
-    if _forecast_service is None:
-        _forecast_service = ForecastService()
-    
-    return _forecast_service.get_forecast(ticker)
+    logger.info(f"Cache miss. Generating new forecast for {ticker}")
+    return _forecast_service_singleton.get_forecast(ticker)
 
-
+# --- 5. СОЗДАЕМ АСИНХРОННУЮ "ОБЕРТКУ", КОТОРУЮ ВЫЗЫВАЕТ FASTAPI ---
 async def get_forecast_async(ticker: str) -> List[float]:
     """
-    Generate a stock price forecast using async execution.
+    Generate a stock price forecast using async execution and caching.
     
-    This function wraps the synchronous forecast generation in an async context
-    to prevent blocking the event loop during ML operations.
+    This function wraps the synchronous, cached forecast generation in an 
+    async context to prevent blocking the event loop.
     
     Args:
         ticker: Stock ticker symbol
@@ -364,12 +369,11 @@ async def get_forecast_async(ticker: str) -> List[float]:
     Returns:
         List of predicted prices
     """
-    global _forecast_service
-    
-    def blocking_forecast():
-        global _forecast_service
-        if _forecast_service is None:
-            _forecast_service = ForecastService()
-        return _forecast_service.get_forecast(ticker)
-    
-    return await asyncio.to_thread(blocking_forecast)
+    try:
+        # Вызываем кэшированную функцию в отдельном потоке
+        return await asyncio.to_thread(_get_forecast_blocking_cached, ticker)
+    except Exception as e:
+        logger.error(f"Error in async forecast for {ticker}: {e}")
+        # Передаем ошибку дальше, чтобы FastAPI мог ее поймать
+        raise
+

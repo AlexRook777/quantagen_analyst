@@ -1,11 +1,13 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, ValidationError
-from api.app.services.forecast_service import get_forecast_async
-from api.app.services.rag_service import get_async_rag_service, shutdown_async_rag_service
+# --- ИЗМЕНЕНЫЙ ИМПОРТ ---
+from api.app.services.forecast_service import get_forecast_async, _forecast_service_singleton
+from api.app.services.rag_service import AsyncRAGService
 import asyncio
 import re
 import logging
+import time # <-- ДОБАВЛЕНО для middleware
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -15,11 +17,22 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan with async service initialization."""
+    logger.info("Application startup...")
     rag_service = None
     try:
-        # Initialize the async RAG service
-        rag_service = await get_async_rag_service()
+        # --- ИЗМЕНЕНО ---
+        # 1. Проверяем, что ForecastService (синглтон) загрузился при импорте
+        if _forecast_service_singleton is None:
+            logger.critical("ForecastService singleton failed to initialize. Aborting startup.")
+            raise RuntimeError("ForecastService singleton failed to initialize.")
+        else:
+            logger.info("ForecastService singleton initialized successfully.")
+            
+        # 2. Инициализируем RAG service
+        rag_service = AsyncRAGService()
         await rag_service.initialize_once()
+        app.state.rag_service = rag_service # Сохраняем сервис в state, чтобы эндпоинты его "видели"
+        
         logger.info("Application started successfully")
         yield
     except Exception as e:
@@ -28,10 +41,27 @@ async def lifespan(app: FastAPI):
     finally:
         # Cleanup resources
         if rag_service:
-            await shutdown_async_rag_service()
+            await rag_service.shutdown()
         logger.info("Application shutdown completed")
 
 app = FastAPI(lifespan=lifespan)
+
+# --- ДОБАВЛЕНО: Middleware для логирования времени ---
+@app.middleware("http")
+async def log_processing_time(request: Request, call_next):
+    start_time = time.perf_counter()
+    response = await call_next(request)
+    processing_time_ms = (time.perf_counter() - start_time) * 1000
+    logger.info(
+        "Request processed",
+        extra={
+            "method": request.method,
+            "path": request.url.path,
+            "status_code": response.status_code,
+            "processing_time_ms": f"{processing_time_ms:.2f}"
+        }
+    )
+    return response
 
 class ForecastRequest(BaseModel):
     ticker: str
@@ -54,7 +84,8 @@ async def forecast(req: ForecastRequest):
         if not re.match(r'^[A-Z]{1,5}$', ticker):
             raise HTTPException(status_code=400, detail="Invalid ticker format")
         
-        # Use async forecast service
+        # --- ИЗМЕНЕНО ---
+        # Вызываем асинхронную, кэшированную функцию
         result = await get_forecast_async(ticker)
         return result
     except ValidationError as e:
@@ -68,7 +99,7 @@ async def forecast(req: ForecastRequest):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/ask_filing")
-async def ask_filing(req: FilingRequest):
+async def ask_filing(request: Request, req: FilingRequest): # <-- ДОБАВЛЕН 'request: Request'
     """Answer questions about company filings using async RAG service."""
     try:
         ticker = req.ticker.upper()
@@ -79,8 +110,9 @@ async def ask_filing(req: FilingRequest):
         if not question or not question.strip():
             raise HTTPException(status_code=400, detail="Question cannot be empty")
         
-        # Use async RAG service
-        rag_service = await get_async_rag_service()
+        # --- ИЗМЕНЕНО ---
+        # Получаем синглтон RAG-сервиса из 'state' (который мы положили туда в lifespan)
+        rag_service: AsyncRAGService = request.app.state.rag_service
         result = await rag_service.answer_question(ticker, question)
         return result
     except ValidationError as e:
@@ -91,13 +123,9 @@ async def ask_filing(req: FilingRequest):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/comprehensive_analysis")
-async def comprehensive_analysis(req: ComprehensiveAnalysisRequest):
+async def comprehensive_analysis(request: Request, req: ComprehensiveAnalysisRequest): # <-- ДОБАВЛЕН 'request: Request'
     """
     Perform comprehensive analysis by running forecast and RAG analysis concurrently.
-    
-    This endpoint demonstrates the power of async execution by running both
-    the ML forecasting and document analysis in parallel, reducing total
-    response time significantly.
     """
     try:
         ticker = req.ticker.upper()
@@ -111,20 +139,25 @@ async def comprehensive_analysis(req: ComprehensiveAnalysisRequest):
         
         logger.info(f"Starting comprehensive analysis for {ticker}")
         
-        # Run both services concurrently
+        # --- ИЗМЕНЕНО ---
+        # Получаем синглтон RAG-сервиса
+        rag_service: AsyncRAGService = request.app.state.rag_service
+        
+        # Создаем задачи для параллельного выполнения
+        # 1. Вызываем кэшированный forecast
         forecast_task = get_forecast_async(ticker)
-        rag_service = await get_async_rag_service()
+        # 2. Вызываем кэшированный RAG
         rag_task = rag_service.answer_question(ticker, question)
         
         # Execute both tasks in parallel
         forecast_result, rag_result = await asyncio.gather(
             forecast_task, 
             rag_task,
-            return_exceptions=True
+            return_exceptions=True # Не "роняем" весь запрос, если одна из задач упала
         )
         
         # Handle potential errors
-        response_data = {
+        response_data: dict = {
             "ticker": ticker,
             "question": question
         }
@@ -151,12 +184,6 @@ async def comprehensive_analysis(req: ComprehensiveAnalysisRequest):
         logger.error(f"Error in comprehensive analysis for {req.ticker}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
-# @app.post("/analyze")
-# def analyze_endpoint(req: AnalyzeRequest):
-#     result = analyze(req.query)
-#     # Optionally log to SQL here
-#     return result
-
 @app.get("/")
 def root():
     """Root endpoint with API information."""
@@ -176,8 +203,9 @@ def health_check():
         "version": "2.0.0",
         "features": ["forecast", "ask_filing", "comprehensive_analysis"],
         "async_improvements": {
-            "forecast_service": "async_wrapper_enabled",
-            "rag_service": "singleton_pattern_enabled", 
+            # --- ОБНОВЛЕНО ---
+            "forecast_service": "singleton_cached_async_wrapper",
+            "rag_service": "singleton_cached_async_wrapper", 
             "concurrent_execution": "comprehensive_analysis_endpoint"
         }
     }

@@ -336,56 +336,6 @@ class RAGService:
             raise
 
 
-# Convenience functions for backward compatibility
-async def initialize_rag_service(config: Optional[RAGConfig] = None) -> RAGService:
-    """
-    Initialize RAG service with backward compatibility.
-    
-    Args:
-        config: Optional configuration object
-        
-    Returns:
-        Initialized RAGService instance
-    """
-    service = RAGService(config)
-    await service.initialize()
-    return service
-
-
-async def shutdown_rag_service(service: RAGService) -> None:
-    """
-    Shutdown RAG service with backward compatibility.
-    
-    Args:
-        service: RAGService instance to shutdown
-    """
-    await service.shutdown()
-
-
-# async def answer_question(ticker: str, question: str) -> Dict[str, Any]:
-#     """
-#     Answer a question with backward compatibility.
-    
-#     Args:
-#         ticker: Stock ticker symbol
-#         question: Question to answer
-        
-#     Returns:
-#         Dictionary with answer and metadata (legacy format)
-#     """
-#     service = await initialize_rag_service()
-#     try:
-#         response = await service.answer_question(ticker, question)
-#         return {
-#             "ticker": response.ticker,
-#             "question": response.question,
-#             "answer": response.answer,
-#             "retrieval_count": response.retrieval_count
-#         }
-#     finally:
-#         await shutdown_rag_service(service)
-
-
 class AsyncRAGService:
     """
     Singleton async wrapper for RAG service to avoid repeated initialization.
@@ -411,7 +361,8 @@ class AsyncRAGService:
     async def initialize_once(self) -> None:
         """Initialize the RAG service once across all instances."""
         if self.service is None:
-            self.service = await initialize_rag_service()
+            self.service = RAGService()
+            await self.service.initialize()
     
     async def answer_question(self, ticker: str, question: str) -> Dict[str, Any]:
         """
@@ -429,21 +380,20 @@ class AsyncRAGService:
         if self.service is None:
             raise RuntimeError("RAG service failed to initialize")
         
-        # --- 3. РЕАЛИЗУЕМ ЛОГИКУ КЭШИРОВАНИЯ ---
-        # Создаем уникальный ключ из (тикера, вопроса)
+        # Cache key creation
         cache_key = (ticker.upper(), question.lower().strip())
         
-        # 3a. Проверяем кэш
+        # Check cache
         cached_result = self.cache.get(cache_key)
         if cached_result:
             logger.info(f"Returning CACHED RAG response for {ticker}")
             return cached_result
             
-        # 3b. Если в кэше нет - выполняем запрос
+        # Cache miss - generate new response
         logger.info(f"Cache miss. Generating new RAG response for {ticker}")
         response_obj = await self.service.answer_question(ticker, question)
         
-        # Конвертируем RAGResponse в словарь для кэширования
+        # Convert RAGResponse to dictionary for caching
         result_dict = {
             "ticker": response_obj.ticker,
             "question": response_obj.question,
@@ -452,32 +402,12 @@ class AsyncRAGService:
             "sources": response_obj.sources
         }
         
-        # 3c. Сохраняем в кэш перед возвратом
+        # Cache the result
         self.cache[cache_key] = result_dict
         return result_dict
     
     async def shutdown(self) -> None:
         """Shutdown the shared RAG service instance."""
         if self.service is not None:
-            await shutdown_rag_service(self.service)
+            await self.service.shutdown()
             self.service = None
-
-
-# Global instance for backward compatibility
-_rag_service = AsyncRAGService()
-
-
-async def get_async_rag_service() -> AsyncRAGService:
-    """
-    Get the global async RAG service instance.
-    
-    Returns:
-        AsyncRAGService instance
-    """
-    return _rag_service
-
-
-async def shutdown_async_rag_service() -> None:
-    """Shutdown the global async RAG service instance."""
-    global _rag_service
-    await _rag_service.shutdown()
