@@ -332,8 +332,7 @@ class ForecastService:
 # Global instance for backward compatibility
 _forecast_service = None
 
-
-async def get_forecast(ticker: str) -> List[float]:
+def get_forecast(ticker: str) -> List[float]:
     """
     Generate a stock price forecast (backward compatibility function).
     
@@ -348,4 +347,28 @@ async def get_forecast(ticker: str) -> List[float]:
     if _forecast_service is None:
         _forecast_service = ForecastService()
     
-    return await asyncio.to_thread(_forecast_service.get_forecast, ticker)
+    return _forecast_service.get_forecast(ticker)
+
+
+async def get_forecast_async(ticker: str) -> List[float]:
+    """
+    Generate a stock price forecast using async execution.
+    
+    This function wraps the synchronous forecast generation in an async context
+    to prevent blocking the event loop during ML operations.
+    
+    Args:
+        ticker: Stock ticker symbol
+        
+    Returns:
+        List of predicted prices
+    """
+    global _forecast_service
+    
+    def blocking_forecast():
+        global _forecast_service
+        if _forecast_service is None:
+            _forecast_service = ForecastService()
+        return _forecast_service.get_forecast(ticker)
+    
+    return await asyncio.to_thread(blocking_forecast)

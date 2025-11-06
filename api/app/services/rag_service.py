@@ -385,3 +385,79 @@ async def answer_question(ticker: str, question: str) -> Dict[str, Any]:
     finally:
         await shutdown_rag_service(service)
 
+
+class AsyncRAGService:
+    """
+    Singleton async wrapper for RAG service to avoid repeated initialization.
+    
+    This class manages a single RAG service instance that can be reused across
+    multiple requests, avoiding the overhead of initialization per request.
+    """
+    
+    _instance: Optional['AsyncRAGService'] = None
+    _initialized: bool = False
+    
+    def __new__(cls) -> 'AsyncRAGService':
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+    
+    def __init__(self):
+        if not self._initialized:
+            self.service: Optional[RAGService] = None
+            self._initialized = True
+    
+    async def initialize_once(self) -> None:
+        """Initialize the RAG service once across all instances."""
+        if self.service is None:
+            self.service = await initialize_rag_service()
+    
+    async def answer_question(self, ticker: str, question: str) -> Dict[str, Any]:
+        """
+        Answer a question using the shared RAG service instance.
+        
+        Args:
+            ticker: Stock ticker symbol
+            question: Question to answer
+            
+        Returns:
+            Dictionary with answer and metadata
+        """
+        await self.initialize_once()
+        
+        if self.service is None:
+            raise RuntimeError("RAG service failed to initialize")
+        
+        response = await self.service.answer_question(ticker, question)
+        return {
+            "ticker": response.ticker,
+            "question": response.question,
+            "answer": response.answer,
+            "retrieval_count": response.retrieval_count
+        }
+    
+    async def shutdown(self) -> None:
+        """Shutdown the shared RAG service instance."""
+        if self.service is not None:
+            await shutdown_rag_service(self.service)
+            self.service = None
+
+
+# Global instance for backward compatibility
+_rag_service = AsyncRAGService()
+
+
+async def get_async_rag_service() -> AsyncRAGService:
+    """
+    Get the global async RAG service instance.
+    
+    Returns:
+        AsyncRAGService instance
+    """
+    return _rag_service
+
+
+async def shutdown_async_rag_service() -> None:
+    """Shutdown the global async RAG service instance."""
+    global _rag_service
+    await _rag_service.shutdown()
