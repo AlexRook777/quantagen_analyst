@@ -16,11 +16,13 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    service = None
     try:
-        await initialize_rag_service()
+        service = await initialize_rag_service()
         yield
     finally:
-        await shutdown_rag_service()
+        if service:
+            await shutdown_rag_service(service)
 
 app = FastAPI(lifespan=lifespan)
 
@@ -42,7 +44,7 @@ async def forecast(req: ForecastRequest):
         # Validate input
         if not re.match(r'^[A-Z]{1,5}$', ticker):
             raise HTTPException(status_code=400, detail="Invalid ticker format")
-        result = get_forecast(ticker)
+        result = await get_forecast(ticker)
         return result
     except ValidationError as e:
         logger.warning(f"Validation error for ticker {req.ticker}: {e}")
@@ -64,7 +66,7 @@ async def ask_filing(req: FilingRequest):
             raise HTTPException(status_code=400, detail="Invalid ticker format")
         if not question or not question.strip():
             raise HTTPException(status_code=400, detail="Question cannot be empty")
-        result = answer_question(ticker, question)
+        result = await answer_question(ticker, question)
         return result
     except ValidationError as e:
         raise HTTPException(status_code=400, detail="Invalid input data")

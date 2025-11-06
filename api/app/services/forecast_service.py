@@ -1,116 +1,351 @@
-import torch
-import yfinance as yf
+"""
+Forecast service for stock price prediction using LSTM neural networks.
+
+This module provides functionality to load financial data, perform feature engineering,
+and generate forecasts using a pre-trained model.
+"""
+
+import asyncio
+import logging
+import os
+from typing import List, Optional
+import joblib
+import numpy as np
 import pandas as pd
 import pandas_ta as ta
-import numpy as np
-import joblib
+import torch
+import yfinance as yf
+from sklearn.preprocessing import StandardScaler
 from api.app.models.forecaster import ForecastModel
-import os # Добавлено для пути
 
-# --- 1. Определение констант ---
-LOOKBACK_WINDOW = 60
-HIDDEN_SIZE = 64
-NUM_LAYERS = 2
-FORECAST_HORIZON = 7
-# INPUT_SIZE будет определен из scaler'а
-SCALER_PATH = "api/saved_models/scaler.joblib"
-MODEL_PATH = "api/saved_models/quant_model.pth"
+logger = logging.getLogger(__name__)
 
-# --- 2. Загрузка артефактов ---
-# Проверяем, существуют ли файлы
-if not os.path.exists(SCALER_PATH) or not os.path.exists(MODEL_PATH):
-    raise FileNotFoundError("Model or scaler not found. Please run the training script first.")
 
-scaler = joblib.load(SCALER_PATH)
-# Определяем INPUT_SIZE из самого scaler'а
-INPUT_SIZE = scaler.n_features_in_
-target_column_index = scaler.feature_names_in_.tolist().index('Close')
-
-model = ForecastModel(input_size=INPUT_SIZE, hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS, output_size=FORECAST_HORIZON)
-model.load_state_dict(torch.load(MODEL_PATH))
-model.eval() # ВАЖНО: перевести в режим инференса
-
-def get_forecast(ticker: str):
-    # 1. Загружаем ПОСЛЕДНИЕ данные
-    # Нам нужно 60 (lookback) + 30 (SMA_30) = 90 дней
-    # Загрузим 150 *календарных* дней (~105 торговых дней), чтобы был запас
-    data = yf.download(ticker, period="150d") # <-- ИЗМЕНЕНО: 100d -> 150d
+class ForecastConfig:
+    """Configuration class for forecast service parameters."""
     
-    if data is None or data.empty:
-        raise ValueError(f"No data downloaded for {ticker}. Check ticker or period.")
-    
-    # --- 2. Делаем АБСОЛЮТНО тот же Feature Engineering, что и в train.py ---
-    
-    # ИСПРАВЛЕНИЕ: yfinance.download() возвращает РАЗНЫЕ столбцы с/без auto_adjust.
-    # Мы должны сделать ИДЕНТИЧНО как в train.py
-    
-    # Шаг 2a: Выравнивание столбцов (если это MultiIndex)
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = ['_'.join(col).strip() for col in data.columns.values]
-        # Переименовываем 'Close_TICKER' в 'Close'
-        close_col_name = f'Close_{ticker.upper()}'
-        if close_col_name in data.columns:
-            data.rename(columns={close_col_name: 'Close'}, inplace=True)
-    
-    # Проверяем, есть ли 'Adj Close', как в train.py
-    if 'Adj Close' not in data.columns:
-        # yfinance > 0.2.0 убрал 'Adj Close' по умолчанию. 
-        # Если в train.py он был, нам нужно его добавить (или переобучить)
-        # Для простоты, предположим, что train.py *тоже* его не имел.
-        # НО! scaler был обучен на 11 фичах. Давайте посмотрим, каких.
-        # scaler.feature_names_in_ покажет нам
-        pass # Мы предполагаем, что scaler был обучен на 11 фичах
-
-    # Шаг 2b: Расчет фичей
-    data['RSI'] = ta.rsi(data['Close'], length=14)
-    macd = ta.macd(data['Close'], fast=12, slow=26, signal=9)
-    data = pd.concat([data, macd], axis=1)
-    data['SMA_7'] = ta.sma(data['Close'], length=7)
-    data['SMA_30'] = ta.sma(data['Close'], length=30)
-    
-    # Шаг 2c: Удаляем NaN *после* всех расчетов
-    data = data.dropna()
-
-    if data.empty:
-        raise ValueError("Data became empty after feature engineering and dropna. Not enough data downloaded.")
-
-    # 3. Берем ПОСЛЕДНИЕ 60 дней
-    # Нам нужны *только* 60 дней. data.tail() - это то, что нужно.
-    last_60_days_raw = data.tail(LOOKBACK_WINDOW)
-
-    # Проверка, что у нас достаточно данных
-    if len(last_60_days_raw) < LOOKBACK_WINDOW:
-        raise ValueError(f"Not enough data to form a {LOOKBACK_WINDOW}-day lookback window. Only got {len(last_60_days_raw)} rows.")
-
-    # 4. Нормализуем их с помощью ЗАГРУЖЕННОГО scaler'а
-    # Убедимся, что столбцы в том же порядке, что и при обучении
-    try:
-        last_60_days_raw_ordered = last_60_days_raw[scaler.feature_names_in_]
-    except KeyError as e:
-        raise ValueError(f"Feature mismatch. Model was trained on features: {scaler.feature_names_in_}, but service has: {data.columns.tolist()}. Error: {e}")
+    def __init__(self):
+        # Model parameters
+        self.lookback_window = 60
+        self.hidden_size = 64
+        self.num_layers = 2
+        self.forecast_horizon = 7
+        self.data_period_days = 150
         
-    last_60_days_scaled = scaler.transform(last_60_days_raw_ordered)
-
-    # 5. Конвертируем в тензор (добавляем batch_size=1)
-    input_tensor = torch.tensor(last_60_days_scaled, dtype=torch.float32).unsqueeze(0)
-
-    # 6. Делаем прогноз
-    with torch.no_grad():
-        prediction_scaled = model(input_tensor).numpy().flatten() # (7,)
-
-    # 7. Инвертируем прогноз обратно к оригинальному масштабу
-    # (Мы используем "трюк" для инвертирования только 1 столбца)
-    
-    # Создаем "пустышку" (dummy array)
-    prediction_unscaled_helper = np.zeros((FORECAST_HORIZON, INPUT_SIZE))
-    
-    # Кладем наши 7-дневные прогнозы в нужную колонку ('Close')
-    prediction_unscaled_helper[:, target_column_index] = prediction_scaled
-
-    # Инвертируем *только* этот helper
-    final_forecast_full = scaler.inverse_transform(prediction_unscaled_helper)
-    
-    # Извлекаем столбец 'Close', который теперь в долларах
-    final_forecast = final_forecast_full[:, target_column_index]
+        # File paths
+        self.base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        self.scaler_path = os.path.join(self.base_dir, "saved_models", "scaler.joblib")
+        self.model_path = os.path.join(self.base_dir, "saved_models", "quant_model.pth")
         
-    return final_forecast.tolist()
+        # Feature engineering parameters
+        self.rsi_length = 14
+        self.macd_fast = 12
+        self.macd_slow = 26
+        self.macd_signal = 9
+        self.sma_short = 7
+        self.sma_long = 30
+
+
+class ForecastService:
+    """
+    Service for generating stock price forecasts using machine learning.
+    
+    This class encapsulates the entire forecasting pipeline including data loading,
+    feature engineering, model inference, and post-processing.
+    """
+    
+    def __init__(self, config: Optional[ForecastConfig] = None):
+        """
+        Initialize the forecast service.
+        
+        Args:
+            config: Configuration object. If None, default config is used.
+        """
+        self.config = config or ForecastConfig()
+        self.model: Optional[ForecastModel] = None
+        self.scaler: Optional[StandardScaler] = None
+        self.input_size: Optional[int] = None
+        self.target_column_index: Optional[int] = None
+        self._initialize_artifacts()
+    
+    def _initialize_artifacts(self):
+        """Load and initialize the ML model and scaler artifacts."""
+        try:
+            # Verify artifact files exist
+            if not os.path.exists(self.config.scaler_path):
+                raise FileNotFoundError(f"Scaler not found at {self.config.scaler_path}")
+            if not os.path.exists(self.config.model_path):
+                raise FileNotFoundError(f"Model not found at {self.config.model_path}")
+            
+            # Load scaler
+            self.scaler = joblib.load(self.config.scaler_path)
+            if not hasattr(self.scaler, 'n_features_in_') or not hasattr(self.scaler, 'feature_names_in_'):
+                raise ValueError("Scaler object missing required attributes")
+            
+            self.input_size = self.scaler.n_features_in_
+            feature_names = self.scaler.feature_names_in_
+            if 'Close' not in feature_names:
+                raise ValueError("'Close' feature not found in scaler feature names")
+            self.target_column_index = feature_names.tolist().index('Close')
+            
+            # Load model
+            self.model = ForecastModel(
+                input_size=self.input_size,
+                hidden_size=self.config.hidden_size,
+                num_layers=self.config.num_layers,
+                output_size=self.config.forecast_horizon
+            )
+            self.model.load_state_dict(torch.load(self.config.model_path))
+            self.model.eval()
+            
+            logger.info("Successfully initialized forecast service artifacts")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize artifacts: {e}")
+            raise
+    
+    def load_stock_data(self, ticker: str) -> pd.DataFrame:
+        """
+        Load stock data from Yahoo Finance.
+        
+        Args:
+            ticker: Stock ticker symbol (e.g., 'AAPL', 'GOOGL')
+            
+        Returns:
+            DataFrame with stock data
+            
+        Raises:
+            ValueError: If no data is downloaded
+        """
+        try:
+            data = yf.download(ticker, period=f"{self.config.data_period_days}d", auto_adjust=True)
+            
+            if data is None or data.empty:
+                raise ValueError(f"No data downloaded for ticker '{ticker}'")
+            
+            logger.info(f"Loaded {len(data)} days of data for {ticker}")
+            return data
+            
+        except Exception as e:
+            logger.error(f"Failed to download data for {ticker}: {e}")
+            raise ValueError(f"Failed to download data for ticker '{ticker}': {e}")
+    
+    def _standardize_columns(self, data: pd.DataFrame, ticker: str) -> pd.DataFrame:
+        """
+        Standardize column names to handle MultiIndex and ticker-specific naming.
+        
+        Args:
+            data: Raw data from yfinance
+            ticker: Stock ticker symbol
+            
+        Returns:
+            DataFrame with standardized column names
+        """
+        if isinstance(data.columns, pd.MultiIndex):
+            # Flatten MultiIndex columns
+            data.columns = ['_'.join(col).strip() for col in data.columns.values]
+            
+            # Rename ticker-specific Close column to generic 'Close'
+            close_col_name = f'Close_{ticker.upper()}'
+            if close_col_name in data.columns:
+                data.rename(columns={close_col_name: 'Close'}, inplace=True)
+        
+        return data
+    
+    def _create_technical_features(self, data: pd.DataFrame) -> pd.DataFrame:
+        """
+        Create technical analysis features from price data.
+        
+        Args:
+            data: DataFrame with OHLCV data
+            
+        Returns:
+            DataFrame with added technical features
+        """
+        # RSI
+        data['RSI'] = ta.rsi(data['Close'], length=self.config.rsi_length)
+        
+        # MACD
+        macd = ta.macd(
+            data['Close'], 
+            fast=self.config.macd_fast, 
+            slow=self.config.macd_slow, 
+            signal=self.config.macd_signal
+        )
+        data = pd.concat([data, macd], axis=1)
+        
+        # Simple Moving Averages
+        data['SMA_7'] = ta.sma(data['Close'], length=self.config.sma_short)
+        data['SMA_30'] = ta.sma(data['Close'], length=self.config.sma_long)
+        
+        # Remove NaN values after feature calculation
+        data = data.dropna()
+        
+        return data
+    
+    def _prepare_input_data(self, ticker: str) -> pd.DataFrame:
+        """
+        Load and prepare data for forecasting.
+        
+        Args:
+            ticker: Stock ticker symbol
+            
+        Returns:
+            DataFrame with processed features
+        """
+        # Load raw data
+        data = self.load_stock_data(ticker)
+        
+        # Standardize column names
+        data = self._standardize_columns(data, ticker)
+        
+        # Create technical features
+        data = self._create_technical_features(data)
+        
+        if data.empty:
+            raise ValueError("Data became empty after feature engineering")
+        
+        # Get the required lookback window
+        last_days = data.tail(self.config.lookback_window)
+        
+        if len(last_days) < self.config.lookback_window:
+            raise ValueError(
+                f"Not enough data: need {self.config.lookback_window} days, "
+                f"got {len(last_days)} days"
+            )
+        
+        return last_days
+    
+    def _normalize_data(self, data: pd.DataFrame) -> np.ndarray:
+        """
+        Normalize data using the pre-loaded scaler.
+        
+        Args:
+            data: DataFrame with feature data
+            
+        Returns:
+            Normalized numpy array
+        """
+        if self.scaler is None:
+            raise RuntimeError("Scaler not initialized")
+        
+        try:
+            # Ensure column order matches training data
+            ordered_data = data[self.scaler.feature_names_in_]
+            return self.scaler.transform(ordered_data)
+        except KeyError:
+            available_cols = set(data.columns)
+            expected_cols = set(self.scaler.feature_names_in_)
+            missing_cols = expected_cols - available_cols
+            
+            raise ValueError(
+                f"Feature mismatch. Missing features: {missing_cols}. "
+                f"Expected: {self.scaler.feature_names_in_}, "
+                f"Available: {data.columns.tolist()}"
+            )
+    
+    def _predict(self, input_data: np.ndarray) -> np.ndarray:
+        """
+        Generate prediction using the loaded model.
+        
+        Args:
+            input_data: Normalized input data
+            
+        Returns:
+            Scaled predictions array
+        """
+        if self.model is None:
+            raise RuntimeError("Model not initialized")
+        
+        # Convert to tensor with batch dimension and ensure shape is correct
+        input_tensor = torch.tensor(input_data, dtype=torch.float32).unsqueeze(0)
+        
+        # Generate prediction
+        with torch.no_grad():
+            prediction_scaled = self.model(input_tensor).numpy().flatten()
+        
+        return prediction_scaled
+    
+    def _inverse_transform_prediction(self, prediction_scaled: np.ndarray) -> List[float]:
+        """
+        Convert scaled predictions back to original price scale.
+        
+        Args:
+            prediction_scaled: Scaled predictions from model
+            
+        Returns:
+            List of price predictions
+        """
+        if self.scaler is None or self.input_size is None or self.target_column_index is None:
+            raise RuntimeError("Scaler not properly initialized")
+        
+        # Create helper array for inverse transform
+        helper = np.zeros((self.config.forecast_horizon, self.input_size))
+        helper[:, self.target_column_index] = prediction_scaled
+        
+        # Inverse transform and extract target column
+        full_prediction = self.scaler.inverse_transform(helper)
+        target_prediction = full_prediction[:, self.target_column_index]
+        
+        return target_prediction.tolist()
+    
+    def get_forecast(self, ticker: str) -> List[float]:
+        """
+        Generate a stock price forecast for the given ticker.
+        
+        Args:
+            ticker: Stock ticker symbol (e.g., 'AAPL', 'GOOGL')
+            
+        Returns:
+            List of predicted prices for the next 7 days
+            
+        Raises:
+            ValueError: If ticker is invalid or insufficient data
+        """
+        try:
+            logger.info(f"Generating forecast for ticker: {ticker}")
+            
+            # Validate ticker
+            if not ticker or not isinstance(ticker, str):
+                raise ValueError("Ticker must be a non-empty string")
+            
+            # Prepare input data
+            prepared_data = self._prepare_input_data(ticker)
+            
+            # Normalize data
+            normalized_data = self._normalize_data(prepared_data)
+            
+            # Generate prediction
+            prediction_scaled = self._predict(normalized_data)
+            
+            # Convert back to original scale
+            final_forecast = self._inverse_transform_prediction(prediction_scaled)
+            
+            logger.info(f"Successfully generated forecast for {ticker}")
+            return final_forecast
+            
+        except Exception as e:
+            logger.error(f"Failed to generate forecast for {ticker}: {e}")
+            raise
+
+
+# Global instance for backward compatibility
+_forecast_service = None
+
+
+async def get_forecast(ticker: str) -> List[float]:
+    """
+    Generate a stock price forecast (backward compatibility function).
+    
+    Args:
+        ticker: Stock ticker symbol
+        
+    Returns:
+        List of predicted prices
+    """
+    global _forecast_service
+    
+    if _forecast_service is None:
+        _forecast_service = ForecastService()
+    
+    return await asyncio.to_thread(_forecast_service.get_forecast, ticker)
