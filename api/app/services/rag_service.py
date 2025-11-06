@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import os
 import logging
 from dotenv import load_dotenv
-import asyncio
+from cachetools import TTLCache
 
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
@@ -362,28 +362,28 @@ async def shutdown_rag_service(service: RAGService) -> None:
     await service.shutdown()
 
 
-async def answer_question(ticker: str, question: str) -> Dict[str, Any]:
-    """
-    Answer a question with backward compatibility.
+# async def answer_question(ticker: str, question: str) -> Dict[str, Any]:
+#     """
+#     Answer a question with backward compatibility.
     
-    Args:
-        ticker: Stock ticker symbol
-        question: Question to answer
+#     Args:
+#         ticker: Stock ticker symbol
+#         question: Question to answer
         
-    Returns:
-        Dictionary with answer and metadata (legacy format)
-    """
-    service = await initialize_rag_service()
-    try:
-        response = await service.answer_question(ticker, question)
-        return {
-            "ticker": response.ticker,
-            "question": response.question,
-            "answer": response.answer,
-            "retrieval_count": response.retrieval_count
-        }
-    finally:
-        await shutdown_rag_service(service)
+#     Returns:
+#         Dictionary with answer and metadata (legacy format)
+#     """
+#     service = await initialize_rag_service()
+#     try:
+#         response = await service.answer_question(ticker, question)
+#         return {
+#             "ticker": response.ticker,
+#             "question": response.question,
+#             "answer": response.answer,
+#             "retrieval_count": response.retrieval_count
+#         }
+#     finally:
+#         await shutdown_rag_service(service)
 
 
 class AsyncRAGService:
@@ -405,6 +405,7 @@ class AsyncRAGService:
     def __init__(self):
         if not self._initialized:
             self.service: Optional[RAGService] = None
+            self.cache: TTLCache = TTLCache(maxsize=256, ttl=3600) # Cache for responses
             self._initialized = True
     
     async def initialize_once(self) -> None:
@@ -428,13 +429,32 @@ class AsyncRAGService:
         if self.service is None:
             raise RuntimeError("RAG service failed to initialize")
         
-        response = await self.service.answer_question(ticker, question)
-        return {
-            "ticker": response.ticker,
-            "question": response.question,
-            "answer": response.answer,
-            "retrieval_count": response.retrieval_count
+        # --- 3. РЕАЛИЗУЕМ ЛОГИКУ КЭШИРОВАНИЯ ---
+        # Создаем уникальный ключ из (тикера, вопроса)
+        cache_key = (ticker.upper(), question.lower().strip())
+        
+        # 3a. Проверяем кэш
+        cached_result = self.cache.get(cache_key)
+        if cached_result:
+            logger.info(f"Returning CACHED RAG response for {ticker}")
+            return cached_result
+            
+        # 3b. Если в кэше нет - выполняем запрос
+        logger.info(f"Cache miss. Generating new RAG response for {ticker}")
+        response_obj = await self.service.answer_question(ticker, question)
+        
+        # Конвертируем RAGResponse в словарь для кэширования
+        result_dict = {
+            "ticker": response_obj.ticker,
+            "question": response_obj.question,
+            "answer": response_obj.answer,
+            "retrieval_count": response_obj.retrieval_count,
+            "sources": response_obj.sources
         }
+        
+        # 3c. Сохраняем в кэш перед возвратом
+        self.cache[cache_key] = result_dict
+        return result_dict
     
     async def shutdown(self) -> None:
         """Shutdown the shared RAG service instance."""
