@@ -42,13 +42,11 @@ async def log_processing_time(request: Request, call_next):
     response = await call_next(request)
     processing_time_ms = (time.perf_counter() - start_time) * 1000
     logger.info(
-        "Request processed",
-        extra={
-            "method": request.method,
-            "path": request.url.path,
-            "status_code": response.status_code,
-            "processing_time_ms": f"{processing_time_ms:.2f}"
-        }
+        f"Request processed: "
+        f"method={request.method} "
+        f"path={request.url.path} "
+        f"status_code={response.status_code} "
+        f"processing_time_ms={processing_time_ms:.2f}"
     )
     return response
 

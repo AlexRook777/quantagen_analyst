@@ -6,11 +6,12 @@ and generate forecasts using a pre-trained model.
 """
 
 import logging
+import datetime
+from dataclasses import dataclass
 import os
 from typing import List, Optional
-import asyncio  # <-- 1. ADDED
-import cachetools.func  # <-- 2. ADDED
-
+import asyncio  
+import cachetools.func  
 import joblib
 import numpy as np
 import pandas as pd
@@ -22,31 +23,37 @@ from api.app.models.forecaster import ForecastModel
 
 logger = logging.getLogger(__name__)
 
-
+@dataclass # <-- 2. Add decorator
 class ForecastConfig:
     """Configuration class for forecast service parameters."""
     
-    def __init__(self):
-        # Model parameters
-        self.lookback_window = 60
-        self.hidden_size = 64
-        self.num_layers = 2
-        self.forecast_horizon = 7
-        self.data_period_days = 150
-        
-        # File paths
-        self.base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-        self.scaler_path = os.path.join(self.base_dir, "saved_models", "scaler.joblib")
-        self.model_path = os.path.join(self.base_dir, "saved_models", "quant_model.pth")
-        
-        # Feature engineering parameters
-        self.rsi_length = 14
-        self.macd_fast = 12
-        self.macd_slow = 26
-        self.macd_signal = 9
-        self.sma_short = 7
-        self.sma_long = 30
+    # Model parameters
+    lookback_window: int = 60
+    hidden_size: int = 64
+    num_layers: int = 2
+    forecast_horizon: int = 7
+    data_period_days: int = 150
+    
+    # Feature engineering parameters
+    rsi_length: int = 14
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal: int = 9
+    sma_short: int = 7
+    sma_long: int = 30
+    
+    # File paths (for model and scaler)
+    base_dir: str = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    scaler_path: str = os.path.join(base_dir, "saved_models", "scaler.joblib")
+    model_path: str = os.path.join(base_dir, "saved_models", "quant_model.pth")
 
+@dataclass
+class ForecastResponse:
+    ticker: str
+    forecast_days: int
+    forecast: List[float]
+    generated_at: str 
+    model_version: str = "1.0.0"
 
 class ForecastService:
     """
@@ -84,6 +91,7 @@ class ForecastService:
             if not hasattr(self.scaler, 'n_features_in_') or not hasattr(self.scaler, 'feature_names_in_'):
                 raise ValueError("Scaler object missing required attributes")
             
+            assert self.scaler is not None, "Scaler should be initialized at this point"
             self.input_size = self.scaler.n_features_in_
             feature_names = self.scaler.feature_names_in_
             if 'Close' not in feature_names:
@@ -292,7 +300,7 @@ class ForecastService:
         
         return target_prediction.tolist()
     
-    def get_forecast(self, ticker: str) -> List[float]:
+    def get_forecast(self, ticker: str) -> ForecastResponse:
         """
         Generate a stock price forecast for the given ticker.
         
@@ -325,7 +333,12 @@ class ForecastService:
             final_forecast = self._inverse_transform_prediction(prediction_scaled)
             
             logger.info(f"Successfully generated forecast for {ticker}")
-            return final_forecast
+            return ForecastResponse(
+                ticker=ticker,
+                forecast_days=self.config.forecast_horizon,
+                forecast=final_forecast,
+                generated_at=datetime.datetime.now(datetime.UTC).isoformat()
+            )
             
         except Exception as e:
             logger.error(f"Failed to generate forecast for {ticker}: {e}")
@@ -343,7 +356,7 @@ except Exception as e:
 # This function will be a "wrapper" for calling our singleton
 # Cache for 100 tickers, "time to live" - 900 seconds (15 minutes)
 @cachetools.func.ttl_cache(maxsize=100, ttl=900)
-def _get_forecast_blocking_cached(ticker: str) -> List[float]:
+def _get_forecast_blocking_cached(ticker: str) -> ForecastResponse:
     """
     Internal cacheable function that performs the heavy work.
     Calls the get_forecast() method of our global singleton.
@@ -356,7 +369,7 @@ def _get_forecast_blocking_cached(ticker: str) -> List[float]:
     return _forecast_service_singleton.get_forecast(ticker)
 
 # --- 5. CREATE ASYNC "WRAPPER" THAT FASTAPI CALLS ---
-async def get_forecast_async(ticker: str) -> List[float]:
+async def get_forecast_async(ticker: str) -> ForecastResponse:
     """
     Generate a stock price forecast using async execution and caching.
     
